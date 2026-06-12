@@ -2,6 +2,12 @@
 import os
 import logging
 from dataclasses import dataclass, field
+from dotenv import load_dotenv
+
+# Load .env and .env.local từ thư mục cha của 'app' sử dụng đường dẫn tuyệt đối
+base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(base_dir, ".env"))
+load_dotenv(os.path.join(base_dir, ".env.local"), override=True)
 
 
 @dataclass
@@ -17,8 +23,9 @@ class Settings:
     app_version: str = field(default_factory=lambda: os.getenv("APP_VERSION", "1.0.0"))
 
     # LLM
-    openai_api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
-    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "gpt-4o-mini"))
+    dashscope_api_key: str = field(default_factory=lambda: os.getenv("DASHSCOPE_API_KEY", ""))
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen-turbo"))
+    base_url: str = field(default_factory=lambda: os.getenv("BASE_URL", ""))
 
     # Security
     agent_api_key: str = field(default_factory=lambda: os.getenv("AGENT_API_KEY", "dev-key-change-me"))
@@ -47,8 +54,10 @@ class Settings:
                 raise ValueError("AGENT_API_KEY must be set in production!")
             if self.jwt_secret == "dev-jwt-secret":
                 raise ValueError("JWT_SECRET must be set in production!")
-        if not self.openai_api_key:
-            logger.warning("OPENAI_API_KEY not set — using mock LLM")
+            if self.llm_model.startswith("qwen") and not self.dashscope_api_key:
+                raise ValueError("DASHSCOPE_API_KEY must be set in production for qwen models!")
+        if not self.dashscope_api_key:
+            logger.warning("DASHSCOPE_API_KEY not set — using mock LLM")
         return self
 
 

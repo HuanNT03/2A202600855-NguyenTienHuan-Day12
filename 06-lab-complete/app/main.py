@@ -14,7 +14,15 @@ Checklist:
   ✅ CORS
   ✅ Error handling
 """
+import sys
 import os
+
+# Thêm thư mục cha của 'app' vào sys.path để hỗ trợ chạy trực tiếp main.py bằng python
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
 import time
 import signal
 import logging
@@ -26,13 +34,12 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Security, Depends, Request, Response
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 import uvicorn
 
 from app.config import settings
-
-# Mock LLM (thay bằng OpenAI/Anthropic khi có API key)
-from utils.mock_llm import ask as llm_ask
+from app.agent_loop import run_react_agent
 
 # ─────────────────────────────────────────────────────────
 # Logging — JSON structured
@@ -49,39 +56,127 @@ _request_count = 0
 _error_count = 0
 
 # ─────────────────────────────────────────────────────────
-# Simple In-memory Rate Limiter
+# Redis Connection — Stateless Design
+# ─────────────────────────────────────────────────────────
+USE_REDIS = False
+_redis = None
+_memory_store = {}
+
+if settings.redis_url:
+    try:
+        import redis
+        _redis = redis.from_url(settings.redis_url, decode_responses=True)
+        _redis.ping()
+        USE_REDIS = True
+        logger.info(json.dumps({"event": "redis_connected", "msg": "Successfully connected to Redis"}))
+    except Exception as e:
+        logger.warning(json.dumps({"event": "redis_failed", "msg": f"Failed to connect to Redis: {str(e)}"}))
+
+# ─────────────────────────────────────────────────────────
+# Stateless Session History Storage
+# ─────────────────────────────────────────────────────────
+def save_history(history_key: str, data: list, ttl_seconds: int = 3600):
+    serialized = json.dumps(data)
+    if USE_REDIS:
+        _redis.setex(f"history:{history_key}", ttl_seconds, serialized)
+    else:
+        _memory_store[f"history:{history_key}"] = data
+
+def load_history(history_key: str) -> list:
+    if USE_REDIS:
+        data = _redis.get(f"history:{history_key}")
+        return json.loads(data) if data else []
+    return _memory_store.get(f"history:{history_key}", [])
+
+def append_to_history(history_key: str, role: str, content: str):
+    history = load_history(history_key)
+    history.append({
+        "role": role,
+        "content": content,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    # Giới hạn lịch sử lưu trữ để tránh quá tải context cho LLM
+    if len(history) > 10:
+        history = history[-10:]
+    save_history(history_key, history)
+    return history
+
+# ─────────────────────────────────────────────────────────
+# Redis-backed Rate Limiter (with In-memory Fallback)
 # ─────────────────────────────────────────────────────────
 _rate_windows: dict[str, deque] = defaultdict(deque)
 
 def check_rate_limit(key: str):
     now = time.time()
-    window = _rate_windows[key]
-    while window and window[0] < now - 60:
-        window.popleft()
-    if len(window) >= settings.rate_limit_per_minute:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Rate limit exceeded: {settings.rate_limit_per_minute} req/min",
-            headers={"Retry-After": "60"},
-        )
-    window.append(now)
+    limit = settings.rate_limit_per_minute
+    window = 60
+    
+    if USE_REDIS:
+        redis_key = f"rate_limit:{key}"
+        pipe = _redis.pipeline()
+        pipe.zremrangebyscore(redis_key, 0, now - window)
+        pipe.zcard(redis_key)
+        pipe.zadd(redis_key, {str(now): now})
+        pipe.expire(redis_key, window)
+        _, current_count, _, _ = pipe.execute()
+        
+        if current_count >= limit:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded: {limit} req/min",
+                headers={"Retry-After": "60"},
+            )
+    else:
+        window_deque = _rate_windows[key]
+        while window_deque and window_deque[0] < now - window:
+            window_deque.popleft()
+        if len(window_deque) >= limit:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded: {limit} req/min",
+                headers={"Retry-After": "60"},
+            )
+        window_deque.append(now)
 
 # ─────────────────────────────────────────────────────────
-# Simple Cost Guard
+# Redis-backed Cost Guard (with In-memory Fallback)
 # ─────────────────────────────────────────────────────────
 _daily_cost = 0.0
 _cost_reset_day = time.strftime("%Y-%m-%d")
 
-def check_and_record_cost(input_tokens: int, output_tokens: int):
+def check_and_record_cost(key: str, input_tokens: int, output_tokens: int):
     global _daily_cost, _cost_reset_day
     today = time.strftime("%Y-%m-%d")
-    if today != _cost_reset_day:
-        _daily_cost = 0.0
-        _cost_reset_day = today
-    if _daily_cost >= settings.daily_budget_usd:
-        raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
-    cost = (input_tokens / 1000) * 0.00015 + (output_tokens / 1000) * 0.0006
-    _daily_cost += cost
+    cost = (input_tokens / 1000) * 0.0003 + (output_tokens / 1000) * 0.0006
+    
+    if USE_REDIS:
+        cost_key = f"cost:{key}:{today}"
+        current_cost_str = _redis.get(cost_key)
+        current_cost = float(current_cost_str) if current_cost_str else 0.0
+        
+        if current_cost >= settings.daily_budget_usd:
+            raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
+            
+        pipe = _redis.pipeline()
+        pipe.incrbyfloat(cost_key, cost)
+        pipe.expire(cost_key, 24 * 3600 * 2) # lưu trong 2 ngày
+        pipe.execute()
+    else:
+        if today != _cost_reset_day:
+            _daily_cost = 0.0
+            _cost_reset_day = today
+        if _daily_cost >= settings.daily_budget_usd:
+            raise HTTPException(503, "Daily budget exhausted. Try tomorrow.")
+        _daily_cost += cost
+
+def get_daily_cost(key: str) -> float:
+    if USE_REDIS:
+        today = time.strftime("%Y-%m-%d")
+        cost_key = f"cost:{key}:{today}"
+        cost_val = _redis.get(cost_key)
+        return float(cost_val) if cost_val else 0.0
+    else:
+        return _daily_cost
 
 # ─────────────────────────────────────────────────────────
 # Auth
@@ -145,7 +240,8 @@ async def request_middleware(request: Request, call_next):
         # Security headers
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
-        response.headers.pop("server", None)
+        if "server" in response.headers:
+            del response.headers["server"]
         duration = round((time.time() - start) * 1000, 1)
         logger.info(json.dumps({
             "event": "request",
@@ -202,11 +298,11 @@ async def ask_agent(
     **Authentication:** Include header `X-API-Key: <your-key>`
     """
     # Rate limit per API key
-    check_rate_limit(_key[:8])  # use first 8 chars as key bucket
+    check_rate_limit(_key[:8])
 
     # Budget check
     input_tokens = len(body.question.split()) * 2
-    check_and_record_cost(input_tokens, 0)
+    check_and_record_cost(_key[:8], input_tokens, 0)
 
     logger.info(json.dumps({
         "event": "agent_call",
@@ -214,10 +310,18 @@ async def ask_agent(
         "client": str(request.client.host) if request.client else "unknown",
     }))
 
-    answer = llm_ask(body.question)
+    # Load conversation history
+    history = load_history(_key[:8])
+
+    # Chạy ReAct Loop của Agent bằng Threadpool để tránh chặn FastAPI Event Loop
+    answer = await run_in_threadpool(run_react_agent, body.question, history=history)
 
     output_tokens = len(answer.split()) * 2
-    check_and_record_cost(0, output_tokens)
+    check_and_record_cost(_key[:8], 0, output_tokens)
+
+    # Lưu lịch sử hội thoại (Stateless - được lưu vào Redis/Memory store)
+    append_to_history(_key[:8], "user", body.question)
+    append_to_history(_key[:8], "assistant", answer)
 
     return AskResponse(
         question=body.question,
@@ -231,7 +335,10 @@ async def ask_agent(
 def health():
     """Liveness probe. Platform restarts container if this fails."""
     status = "ok"
-    checks = {"llm": "mock" if not settings.openai_api_key else "openai"}
+    checks = {
+        "llm": "mock" if not settings.dashscope_api_key else "qwen-turbo",
+        "redis": "connected" if USE_REDIS else "disconnected"
+    }
     return {
         "status": status,
         "version": settings.app_version,
@@ -248,19 +355,22 @@ def ready():
     """Readiness probe. Load balancer stops routing here if not ready."""
     if not _is_ready:
         raise HTTPException(503, "Not ready")
+    if settings.redis_url and not USE_REDIS:
+        raise HTTPException(503, "Redis connection failed")
     return {"ready": True}
 
 
 @app.get("/metrics", tags=["Operations"])
 def metrics(_key: str = Depends(verify_api_key)):
     """Basic metrics (protected)."""
+    current_cost = get_daily_cost(_key[:8])
     return {
         "uptime_seconds": round(time.time() - START_TIME, 1),
         "total_requests": _request_count,
         "error_count": _error_count,
-        "daily_cost_usd": round(_daily_cost, 4),
+        "daily_cost_usd": round(current_cost, 4),
         "daily_budget_usd": settings.daily_budget_usd,
-        "budget_used_pct": round(_daily_cost / settings.daily_budget_usd * 100, 1),
+        "budget_used_pct": round(current_cost / settings.daily_budget_usd * 100, 1) if settings.daily_budget_usd > 0 else 0,
     }
 
 
